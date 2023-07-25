@@ -243,6 +243,11 @@ def get_sparse_pruning_shared_parameters(param_dict):
         ], f"Invalid sparse pruning method. Supported types: [{SPARSE_PRUNING_METHOD_L1}, {SPARSE_PRUNING_METHOD_TOPK}, {SPARSE_PRUNING_METHOD_SNIP_MOMENTUM}]"
         output[SPARSE_PRUNING_SCHEDULE_OFFSET] = get_scalar_param(sub_param_dict, SPARSE_PRUNING_SCHEDULE_OFFSET,
                                                                   SPARSE_PRUNING_SCHEDULE_OFFSET_DEFAULT)
+
+        output[SPARSE_PRUNING_SCHEDULE_OFFSET_END] = get_scalar_param(sub_param_dict,
+                                                                      SPARSE_PRUNING_SCHEDULE_OFFSET_END, SPARSE_PRUNING_SCHEDULE_OFFSET_END_DEFAULT)
+
+
         if output[SPARSE_PRUNING_METHOD] == SPARSE_PRUNING_METHOD_SNIP_MOMENTUM:
             output[SPARSE_PRUNING_BLOCK_PATTERN] = get_scalar_param(sub_param_dict, SPARSE_PRUNING_BLOCK_PATTERN,
                                                                     SPARSE_PRUNING_BLOCK_PATTERN_DEFAULT)

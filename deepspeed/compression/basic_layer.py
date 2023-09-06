@@ -361,8 +361,74 @@ class LinearLayer_Compress(nn.Linear):
         shape = w.shape
         return (w.t().reshape(self.num_heads, -1) * mask.view(-1, 1)).reshape(shape[1], shape[0]).t()
 
-    def forward(self, input, skip_bias_add=False):
+    def calc_quantization_params(self, data_buffer, num_bits):
+        q_range = 2**num_bits
+        # min_val, max_val = torch.aminmax(data_buffer)
+        max_val = data_buffer.amax()#(dim=-1, keepdim=True)
+        min_val = data_buffer.amin()#(dim=-1, keepdim=True)
+        # (bit_range -1) for int, bit_range without (-1) for uint
+        scale = (max_val - min_val) / (2**num_bits - 1)
+        zero_point = (min_val / scale).round() * scale # mul by scale for float
+        quantized_buffer = ((data_buffer - zero_point) / scale).round().clamp(0, q_range - 1)
+        return scale, zero_point, quantized_buffer
 
+    def calc_partial_quantization_params(self, in_sf, weight_sf, data_buffer, num_bits):
+        # quantizing bias buffer based on input and weights scale
+        q_range = 2**num_bits
+        min_val = data_buffer.amin(dim=-1, keepdim=True)
+        scale = in_sf * weight_sf
+        zero_point = (min_val / scale).round() * scale # mul by scale for float
+        quantized_buffer = ((data_buffer - zero_point) / scale).round().clamp(0, q_range - 1)
+        return scale, zero_point, quantized_buffer
+        
+    
+    def dump_quantization_data(self, scale, zero_point, quantized_buffer, buffer_type: str):
+        import os
+        if not os.path.isdir("out/bins"):
+            os.mkdir("out/bins")
+        if not os.path.isdir("out/sf"):
+            os.mkdir("out/sf")
+        dump_zero_point = False
+        if dump_zero_point:
+            if not os.path.isdir("out/zp"):
+                os.mkdir("out/zp")
+        # create file name
+        base_name = self.scope_name.replace(".", "_")
+        dump_file_name = f"{base_name}_{buffer_type}"
+        # dump the data to bin file
+        bin_data = quantized_buffer.cpu().detach().numpy()
+        binary_path = os.path.join(
+            "out/bins", f"{dump_file_name}.bin"
+        )
+        bin_data.tofile(binary_path.lower())
+        # dump scale to txt
+        # scale = scale.repeat(quantized_buffer.shape[0])    # imitate scale per channel
+        scale_data = scale.cpu().detach().numpy()
+        scale_path = os.path.join("out/sf", f"{dump_file_name}_sf.txt")
+        scale_data.tofile(scale_path.lower(), sep="\n", format="%f")
+        # dump zero point to txt
+        if dump_zero_point:
+            # zero_point = zero_point.repeat(quantized_buffer[0].shape[0])    # imitate scale per channel
+            zero_point_data = zero_point.cpu().detach().numpy()
+            zero_point_path = os.path.join("out/zp", f"{dump_file_name}_zp.txt")
+            zero_point_data.tofile(zero_point_path.lower(), sep="\n", format="%f")
+        # add to dict
+
+    def forward(self, input, skip_bias_add=False):
+        # quantize input
+        in_scale, in_zp, in_quantized = self.calc_quantization_params(input, 8)
+        self.dump_quantization_data(in_scale, in_zp, in_quantized, "input")
+        # quantize weights
+        weight_scale, weight_zp, weight_quantized = self.calc_quantization_params(self.weight, 8 
+                                                                                #   self.weight.target_bits
+                                                                                  )
+        self.dump_quantization_data(weight_scale, weight_zp, weight_quantized, "weight")
+        # quantize bias
+        bias_scale, bias_zp, bias_quantized = self.calc_partial_quantization_params(in_scale, weight_scale, self.bias, 32)
+        self.dump_quantization_data(bias_scale, bias_zp, bias_quantized, "bias")
+        
+        
+        
         if self.weight_quantization_enabled_in_forward and self.weight_quantization_enabled:
             weight = self.weight_quantizer(self.weight, self.weight.target_bits, None, None,
                                            self.weight_quantize_num_groups)
@@ -370,7 +436,7 @@ class LinearLayer_Compress(nn.Linear):
         else:
             weight = self.weight
             bias = self.bias
-
+        
         if self.sparse_pruning_enabled and self.sparse_pruning_method:
             mask = self.get_mask(pruning_type='sparse')
             weight = weight * mask.view(self.weight.size())
@@ -392,13 +458,19 @@ class LinearLayer_Compress(nn.Linear):
                 num_groups = 1
             input = self.activation_quantizer(input, self.activation_quantization_bits, None, None, num_groups)
 
-        if skip_bias_add:
-            # used for mpu linear layers
-            output = nn.functional.linear(input, weight, None)
-            return output, bias
-        else:
-            output = nn.functional.linear(input, weight, bias)
-            return output
+        # if skip_bias_add:
+        #     # used for mpu linear layers
+        #     output = nn.functional.linear(input, weight, None)
+        #     return output, bias
+        # else:
+        #     output = nn.functional.linear(input, weight, bias)
+        #     return output
+            
+        output = nn.functional.linear(input, weight, bias if skip_bias_add == False else None)
+        output_scale, output_zp, output_quantized = self.calc_quantization_params(output, 8)
+        self.dump_quantization_data(output_scale, output_zp, output_quantized, "output")
+        
+        return output if skip_bias_add == False else (output, bias)
 
 
 class Conv2dLayer_Compress(nn.Conv2d):

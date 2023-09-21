@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
+import os
+import math
+from typing import Union, Tuple
 import torch
 from torch import autograd
-import math
 
 
 class TopKBinarizer(autograd.Function):
@@ -44,15 +45,15 @@ class TopKBinarizer(autograd.Function):
 
         # flat_out and mask access the same memory.
         flat_out = mask.flatten()
-        flat_out[idx[j:]] = 0.
-        flat_out[idx[:j]] = 1.
+        flat_out[idx[j:]] = 0.0
+        flat_out[idx[:j]] = 1.0
         ctx.save_for_backward(mask)
 
         return mask
 
     @staticmethod
     def backward(ctx, gradOutput):
-        mask, = ctx.saved_tensors
+        (mask,) = ctx.saved_tensors
         if ctx.sigmoid:
             return gradOutput.clone(), ((gradOutput * mask).sum()).view(-1), None
         else:
@@ -80,8 +81,9 @@ class SymQuantizer(torch.autograd.Function):
             quantized_input (`torch.FloatTensor`)
                 Quantized input
         """
-        assert (min_value is None and max_value is None) or (min_value is not None and max_value is not None
-                                                             and num_groups == 1)
+        assert (min_value is None and max_value is None) or (
+            min_value is not None and max_value is not None and num_groups == 1
+        )
         q_range = 2**num_bits
         input_shape = input.shape
         if min_value is None:
@@ -123,8 +125,9 @@ class AsymQuantizer(torch.autograd.Function):
                 Quantized input
         """
 
-        assert (min_value is None and max_value is None) or (min_value is not None and max_value is not None
-                                                             and num_groups == 1)
+        assert (min_value is None and max_value is None) or (
+            min_value is not None and max_value is not None and num_groups == 1
+        )
         q_range = 2**num_bits
         input_shape = input.shape
         if min_value is None:
@@ -135,7 +138,9 @@ class AsymQuantizer(torch.autograd.Function):
         scale = (max_value - min_value) / q_range
         zero_point = (min_value / scale).round() * scale
 
-        output = ((input - zero_point) / scale).round().clamp(0, q_range - 1) * scale + zero_point
+        output = ((input - zero_point) / scale).round().clamp(
+            0, q_range - 1
+        ) * scale + zero_point
         output = output.reshape(input_shape).contiguous()
         return output
 
@@ -167,7 +172,7 @@ class TernaryQuantizer(torch.autograd.Function):
                 Quantized input
         """
 
-        assert (min_value is None and max_value is None)
+        assert min_value is None and max_value is None
         input_flat = input.reshape(num_groups, -1)
         n = input_flat.shape[1]
         m = input_flat.norm(p=1, dim=1).div(n)
@@ -208,7 +213,7 @@ class BinaryQuantizer(torch.autograd.Function):
                 Quantized input
         """
 
-        assert (min_value is None and max_value is None)
+        assert min_value is None and max_value is None
         input_flat = input.reshape(num_groups, -1)
         n = input_flat.shape[1]
         m = input_flat.norm(p=1, dim=1, keepdim=True).div(n)
@@ -220,3 +225,119 @@ class BinaryQuantizer(torch.autograd.Function):
     def backward(ctx, grad_output):
         grad_input = grad_output.clone()
         return grad_input, None, None, None, None
+
+
+class GeneralQuantizer:
+    """
+    General Quantizer used for pure and straight-forward general quantization functionality
+    """
+
+    @staticmethod
+    def calc_quantization_params(
+        data_buffer: torch.tensor, num_bits: int
+    ) -> Tuple[float, float, torch.tensor]:
+        """
+        calculate quantization parameters for a given data buffer
+        :param torch.tensor data_buffer: float data buffer
+        :param int num_bits: number of bits for quantization
+        :return tuple(float, float, torch.tensor): scale, zero_point, quantized_buffer
+        """
+        q_range = 2**num_bits
+        max_val = data_buffer.amax()  # (dim=-1, keepdim=True)
+        min_val = data_buffer.amin()  # (dim=-1, keepdim=True)
+        scale = (max_val - min_val) / (
+            2 ** (num_bits - 1) - 1
+        )  # (num_bits -1) for int, num_bits without (-1) for uint
+        zero_point = (min_val / scale).round() * scale  # mul by scale for float value
+        quantized_buffer = (
+            ((data_buffer - zero_point) / scale).round().clamp(0, q_range - 1)
+        )  # quant the data buffer
+        return scale, zero_point, quantized_buffer
+
+    @staticmethod
+    def calc_partial_quantization_params(
+        in_sf: Union[float, torch.tensor],
+        weight_sf: Union[float, torch.tensor],
+        data_buffer: torch.tensor,
+        num_bits: int,
+    ) -> Tuple[float, float, torch.tensor]:
+        """
+        quantizing bias buffer based on input and weights scale
+        :param Union[float, torch.tensor] in_sf: in scale factor
+        :param Union[float, torch.tensor] weight_sf: weight scale factor
+        :param torch.tensor data_buffer: float data buffer
+        :param int num_bits: number of bits for quantization
+        :return tuple(float, float, torch.tensor): scale, zero_point, quantized_buffer
+        """
+        q_range = 2**num_bits
+        min_val = data_buffer.amin(dim=-1, keepdim=True)
+        scale = in_sf * weight_sf
+        zero_point = (min_val / scale).round() * scale  # mul by scale for float
+        quantized_buffer = (
+            ((data_buffer - zero_point) / scale).round().clamp(0, q_range - 1)
+        )
+        return scale, zero_point, quantized_buffer
+
+
+class DataDumper:
+    """
+    DataDumper used for dumping data to file
+    """
+
+    def __init__(self):
+        self.main_out_folder = "out/"
+
+    def set_out_folder_path(self, name: str) -> None:
+        self.main_out_folder += name
+        if not os.path.isdir(self.main_out_folder):
+            os.mkdir(self.main_out_folder)
+
+    def dump_quantization_data(
+        self,
+        scope_name: str,
+        scale: Union[float, torch.tensor],
+        zero_point: Union[float, torch.tensor],
+        quantized_buffer: torch.tensor,
+        buffer_type: str,
+    ) -> None:
+        """
+        dump quantization data to file
+        :param str scope_name: name of the scope
+        :param Union[float, torch.tensor] scale: scale factor
+        :param Union[float, torch.tensor] zero_point: zero point
+        :param torch.tensor quantized_buffer: quantized buffer
+        :param str buffer_type: type of the buffer
+        """
+        bin_folder = f"{self.main_out_folder}/bins"
+        sf_folder = f"{self.main_out_folder}/sf"
+        zp_folder = f"{self.main_out_folder}/zp"
+        if not os.path.isdir(bin_folder):
+            os.mkdir(bin_folder)
+        if not os.path.isdir(sf_folder):
+            os.mkdir(sf_folder)
+        dump_zero_point = False
+        if dump_zero_point:
+            if not os.path.isdir(zp_folder):
+                os.mkdir(zp_folder)
+        # create file name
+        base_name = scope_name.replace(".", "_")
+        dump_file_name = f"{base_name}_{buffer_type}"
+        # dump the data to bin file
+        bin_data = quantized_buffer.cpu().detach().numpy()
+        binary_path = os.path.join(bin_folder, f"{dump_file_name}.bin")
+        bin_data.tofile(binary_path.lower())
+        # dump scale to txt
+        # scale = scale.repeat(quantized_buffer.shape[0])    # imitate scale per channel
+        scale_data = scale.cpu().detach().numpy()
+        scale_path = os.path.join(sf_folder, f"{dump_file_name}_sf.txt")
+        scale_data.tofile(scale_path.lower(), sep="\n", format="%f")
+        # dump zero point to txt
+        if dump_zero_point:
+            # zero_point = zero_point.repeat(quantized_buffer[0].shape[0])    # imitate scale per channel
+            zero_point_data = zero_point.cpu().detach().numpy()
+            zero_point_path = os.path.join(zp_folder, f"{dump_file_name}_zp.txt")
+            zero_point_data.tofile(zero_point_path.lower(), sep="\n", format="%f")
+        # add to dict
+
+
+global_data_dumper = DataDumper()
